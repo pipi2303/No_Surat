@@ -1,0 +1,37 @@
+version: '3.9'
+services:
+  app:
+    build: .
+    container_name: office_letter_app
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - SQL_HOST=postgres
+      - SQL_DB_NAME=office_letters_db
+      - SQL_USER=olms_user
+      - SQL_PASSWORD=olms_secure_pass
+      - SQL_ADMIN_USER=olms_user
+      - SQL_ADMIN_PASSWORD=olms_secure_pass
+    volumes:
+      - letter_uploads:/app/uploads
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: office_letter_postgres
+    environment:
+      - POSTGRES_DB=office_letters_db
+      - POSTGRES_USER=olms_user
+      - POSTGRES_PASSWORD=olms_secure_pass
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  letter_uploads:
