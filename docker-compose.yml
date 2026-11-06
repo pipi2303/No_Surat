@@ -2,7 +2,7 @@ version: '3.9'
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: mirror.gcr.io/library/postgres:16-alpine
     container_name: nosurat_db
     restart: unless-stopped
     environment:
@@ -48,7 +48,7 @@ services:
       start_period: 30s
 
   nginx:
-    image: nginx:1.27-alpine
+    image: mirror.gcr.io/library/nginx:1.27-alpine
     container_name: nosurat_nginx
     restart: unless-stopped
     ports:
