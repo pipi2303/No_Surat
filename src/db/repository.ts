@@ -1612,6 +1612,29 @@ export async function getDashboardAnalytics(filters: {
   }
 }
 
+export async function ensureInitialAdmin(): Promise<void> {
+  const existing = await db.select().from(users).where(eq(users.isDemo, false));
+  if (existing.length > 0) return; // Real user already exists
+
+  const email = process.env.INITIAL_ADMIN_EMAIL || 'admin@nosurat.local';
+  const name  = process.env.INITIAL_ADMIN_NAME  || 'Administrator';
+  const pass  = process.env.INITIAL_ADMIN_PASSWORD || 'Admin123!';
+
+  const depts = await db.select().from(departments);
+  await db.insert(users).values({
+    uid: `admin-init-${Date.now()}`,
+    name,
+    email,
+    passwordHash: hashPassword(pass),
+    roleCode: 'SUPER_ADMIN',
+    departmentId: depts[0]?.id ?? null,
+    isActive: true,
+    isDemo: false,
+  }).onConflictDoNothing();
+
+  console.log(`[INIT] Admin created → email: ${email}  password: ${pass}`);
+}
+
 export async function ensureIndexes(): Promise<void> {
   const indexes = [
     sql`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)`,

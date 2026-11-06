@@ -25,6 +25,7 @@ import {
   cancelLetter,
   createOrRegisterLetter,
   ensureIndexes,
+  ensureInitialAdmin,
   ensureSeeded,
   formatLetterNumber,
   getDashboardAnalytics,
@@ -1701,6 +1702,7 @@ async function startServer() {
   await initStorage();
   await ensureSchema(pool);
   await ensureSeeded();
+  await ensureInitialAdmin();
   await ensureIndexes();
 
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
