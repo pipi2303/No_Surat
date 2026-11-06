@@ -46,6 +46,7 @@ import {
   removeFile,
   saveFile,
 } from './src/lib/storage.ts';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
 
 // Structured logger
 const log = {
@@ -1699,6 +1700,8 @@ async function startServer() {
 
   validateEnv();
   await initStorage();
+  // Run SQL migrations to create/update tables before any app code touches the DB
+  await migrate(db, { migrationsFolder: './drizzle' });
   await ensureSeeded();
   await ensureIndexes();
 
