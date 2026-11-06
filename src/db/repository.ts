@@ -1613,12 +1613,13 @@ export async function getDashboardAnalytics(filters: {
 }
 
 export async function ensureInitialAdmin(): Promise<void> {
-  const existing = await db.select().from(users).where(eq(users.isDemo, false));
-  if (existing.length > 0) return; // Real user already exists
-
   const email = process.env.INITIAL_ADMIN_EMAIL || 'admin@nosurat.local';
   const name  = process.env.INITIAL_ADMIN_NAME  || 'Administrator';
   const pass  = process.env.INITIAL_ADMIN_PASSWORD || 'Admin123!';
+
+  // Create this specific email if it doesn't exist yet (safe to re-run)
+  const existing = await db.select().from(users).where(eq(users.email, email));
+  if (existing.length > 0) return;
 
   const depts = await db.select().from(departments);
   await db.insert(users).values({
@@ -1632,7 +1633,7 @@ export async function ensureInitialAdmin(): Promise<void> {
     isDemo: false,
   }).onConflictDoNothing();
 
-  console.log(`[INIT] Admin created → email: ${email}  password: ${pass}`);
+  console.log(`[INIT] Admin created → ${email}`);
 }
 
 export async function ensureIndexes(): Promise<void> {
