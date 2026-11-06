@@ -5,7 +5,7 @@ import fs from 'fs';
 import multer from 'multer';
 import { z } from 'zod';
 import { desc, eq, ilike, and, or, sql, count } from 'drizzle-orm';
-import { db } from './src/db/index.ts';
+import { db, ensureSchema, pool } from './src/db/index.ts';
 import {
   auditLogs,
   companySettings,
@@ -46,7 +46,6 @@ import {
   removeFile,
   saveFile,
 } from './src/lib/storage.ts';
-import { migrate } from 'drizzle-orm/node-postgres/migrator';
 
 // Structured logger
 const log = {
@@ -1700,8 +1699,7 @@ async function startServer() {
 
   validateEnv();
   await initStorage();
-  // Run SQL migrations to create/update tables before any app code touches the DB
-  await migrate(db, { migrationsFolder: './drizzle' });
+  await ensureSchema(pool);
   await ensureSeeded();
   await ensureIndexes();
 
