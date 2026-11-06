@@ -24,6 +24,8 @@ import {
 
 interface LettersListViewProps {
   fixedCategory?: LetterCategory | 'ALL';
+  externalSearchQuery?: string;
+  externalSearchTrigger?: number;
   departments: Department[];
   letterTypes: LetterType[];
   classifications: LetterClassification[];
@@ -54,6 +56,8 @@ const CATEGORY_TITLES: Record<string, { title: string; subtitle: string }> = {
 
 export function LettersListView({
   fixedCategory = 'ALL',
+  externalSearchQuery = '',
+  externalSearchTrigger = 0,
   departments,
   letterTypes,
   classifications,
@@ -61,7 +65,7 @@ export function LettersListView({
   onSelectLetter,
   onNavigateCreate,
 }: LettersListViewProps) {
-  const [search, setSearch] = useState('');
+  const [search, setSearch] = useState(externalSearchQuery);
   const [category, setCategory] = useState<string>(fixedCategory);
   const [departmentId, setDepartmentId] = useState<string>('');
   const [letterTypeId, setLetterTypeId] = useState<string>('');
@@ -86,12 +90,20 @@ export function LettersListView({
     setPage(1);
   }, [fixedCategory]);
 
-  const fetchLetters = async () => {
+  useEffect(() => {
+    if (externalSearchTrigger > 0) {
+      setSearch(externalSearchQuery);
+      setPage(1);
+    }
+  }, [externalSearchQuery, externalSearchTrigger]);
+
+  const fetchLetters = async (overrideSearch?: string) => {
     setLoading(true);
     setError(null);
     try {
+      const activeSearch = overrideSearch !== undefined ? overrideSearch : search;
       const params = new URLSearchParams();
-      if (search.trim()) params.set('search', search.trim());
+      if (activeSearch.trim()) params.set('search', activeSearch.trim());
       if (category && category !== 'ALL') params.set('category', category);
       if (departmentId) params.set('departmentId', departmentId);
       if (letterTypeId) params.set('letterTypeId', letterTypeId);
@@ -122,8 +134,20 @@ export function LettersListView({
   };
 
   useEffect(() => {
-    fetchLetters();
-  }, [category, departmentId, letterTypeId, classificationId, status, year, dateFrom, dateTo, page, limit]);
+    fetchLetters(externalSearchTrigger > 0 ? externalSearchQuery : undefined);
+  }, [
+    category,
+    departmentId,
+    letterTypeId,
+    classificationId,
+    status,
+    year,
+    dateFrom,
+    dateTo,
+    page,
+    limit,
+    externalSearchTrigger,
+  ]);
 
   const handleResetFilters = () => {
     setSearch('');

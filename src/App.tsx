@@ -25,7 +25,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { apiRequest, setAuthToken } from './lib/api.ts';
+import { apiRequest, getAuthToken, setAuthToken } from './lib/api.ts';
 import {
   CompanySettings,
   DemoAccount,
@@ -46,6 +46,7 @@ import { LetterDetailModal } from './components/LetterDetailModal.tsx';
 import { MasterDataView } from './components/MasterDataView.tsx';
 import { ReportsView } from './components/ReportsView.tsx';
 import { AuditAndSystemView } from './components/AuditAndSystemView.tsx';
+import { GlobalSearchBar } from './components/GlobalSearchBar.tsx';
 
 type NavPage =
   | 'DASHBOARD'
@@ -71,7 +72,7 @@ const ROLE_LABELS: Record<RoleCode, string> = {
 export default function App() {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [demoAccounts, setDemoAccounts] = useState<DemoAccount[]>([]);
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(true);
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [initializing, setInitializing] = useState<boolean>(true);
 
   // Navigation State
@@ -90,8 +91,10 @@ export default function App() {
   const [numberingCounters, setNumberingCounters] = useState<NumberingCounter[]>([]);
   const [companySettings, setCompanySettings] = useState<CompanySettings | null>(null);
 
-  // Detail Modal & Toast State
+  // Detail Modal, Global Search & Toast State
   const [selectedLetterId, setSelectedLetterId] = useState<number | null>(null);
+  const [globalSearchQuery, setGlobalSearchQuery] = useState<string>('');
+  const [globalSearchTrigger, setGlobalSearchTrigger] = useState<number>(0);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [dashboardRefreshTrigger, setDashboardRefreshTrigger] = useState(0);
 
@@ -104,8 +107,16 @@ export default function App() {
 
   const loadMasterAndProfile = async () => {
     try {
-      const [demoRes, meRes, masterRes] = await Promise.all([
-        apiRequest<{ accounts: DemoAccount[] }>('/api/auth/demo-accounts'),
+      const demoRes = await apiRequest<{ accounts: DemoAccount[] }>('/api/auth/demo-accounts');
+      setDemoAccounts(demoRes.accounts);
+
+      if (!getAuthToken()) {
+        setIsAuthenticated(false);
+        setInitializing(false);
+        return;
+      }
+
+      const [meRes, masterRes] = await Promise.all([
         apiRequest<{ user: UserProfile }>('/api/auth/me'),
         apiRequest<{
           departments: Department[];
@@ -117,7 +128,6 @@ export default function App() {
         }>('/api/master-bundle'),
       ]);
 
-      setDemoAccounts(demoRes.accounts);
       setCurrentUser(meRes.user);
       setDepartments(masterRes.departments);
       setLetterTypes(masterRes.letterTypes);
@@ -269,7 +279,7 @@ export default function App() {
 
           {/* Primary Navigation Menu (Role-Based) */}
           <nav className="space-y-5 text-xs">
-            {/* 1. Dashboard & Registrasi */}
+            {/* Dashboard & Registrasi */}
             <div className="space-y-1">
               <div className="px-2.5 text-[10px] font-semibold tracking-wider text-slate-400 uppercase mb-1.5">
                 Utama
@@ -284,7 +294,7 @@ export default function App() {
                 }`}
               >
                 <LayoutDashboard className="w-4 h-4 shrink-0" />
-                <span>1. Dashboard Eksekutif</span>
+                <span>Dashboard Eksekutif</span>
               </button>
 
               {canCreateLetter && (
@@ -301,15 +311,15 @@ export default function App() {
                   }`}
                 >
                   <FilePlus2 className="w-4 h-4 shrink-0" />
-                  <span>3. Buat / Registrasi Surat</span>
+                  <span>Buat / Registrasi Surat</span>
                 </button>
               )}
             </div>
 
-            {/* 2. Manajemen Surat */}
+            {/* Manajemen Surat */}
             <div className="space-y-1">
               <div className="px-2.5 text-[10px] font-semibold tracking-wider text-slate-400 uppercase mb-1.5">
-                2. Manajemen Surat
+                Manajemen Surat
               </div>
               <button
                 type="button"
@@ -364,10 +374,10 @@ export default function App() {
               </button>
             </div>
 
-            {/* 4. Master Data */}
+            {/* Master Data */}
             <div className="space-y-1">
               <div className="px-2.5 text-[10px] font-semibold tracking-wider text-slate-400 uppercase mb-1.5">
-                4. Master Data & Penomoran
+                Master Data & Penomoran
               </div>
               {[
                 { sub: 'RULES', label: 'Aturan Penomoran', icon: Hash },
@@ -399,7 +409,7 @@ export default function App() {
               })}
             </div>
 
-            {/* 5 - 8. Laporan, Audit, Pengguna, Pengaturan */}
+            {/* Laporan, Audit, Pengguna, Pengaturan */}
             <div className="space-y-1">
               <div className="px-2.5 text-[10px] font-semibold tracking-wider text-slate-400 uppercase mb-1.5">
                 Tata Kelola & Sistem
@@ -414,7 +424,7 @@ export default function App() {
                 }`}
               >
                 <FileBarChart2 className="w-4 h-4 shrink-0" />
-                <span>5. Laporan Surat</span>
+                <span>Laporan Surat</span>
               </button>
 
               {canViewAudit && (
@@ -428,7 +438,7 @@ export default function App() {
                   }`}
                 >
                   <History className="w-4 h-4 shrink-0" />
-                  <span>6. Audit Trail</span>
+                  <span>Audit Trail</span>
                 </button>
               )}
 
@@ -443,7 +453,7 @@ export default function App() {
                   }`}
                 >
                   <Users className="w-4 h-4 shrink-0" />
-                  <span>7. Manajemen Pengguna</span>
+                  <span>Manajemen Pengguna</span>
                 </button>
               )}
 
@@ -457,13 +467,13 @@ export default function App() {
                 }`}
               >
                 <Settings className="w-4 h-4 shrink-0" />
-                <span>8. Pengaturan & Uji Sistem</span>
+                <span>Pengaturan & Uji Sistem</span>
               </button>
             </div>
           </nav>
         </div>
 
-        {/* 9. Logout & User Footer */}
+        {/* Logout & User Footer */}
         <div className="p-4 border-t border-slate-800 bg-slate-950/50 space-y-3">
           <div className="text-xs">
             <div className="font-semibold text-white truncate">{currentUser.name}</div>
@@ -478,7 +488,7 @@ export default function App() {
             className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-slate-800 hover:bg-red-600/90 text-slate-200 hover:text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
           >
             <LogOut className="w-3.5 h-3.5" />
-            <span>9. Keluar (Logout)</span>
+            <span>Keluar (Logout)</span>
           </button>
         </div>
       </aside>
@@ -486,8 +496,8 @@ export default function App() {
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Top Enterprise Header */}
-        <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3.5 flex items-center justify-between gap-4 no-print">
-          <div className="flex items-center gap-3 min-w-0">
+        <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 flex flex-wrap lg:flex-nowrap items-center justify-between gap-3 sm:gap-4 no-print">
+          <div className="flex items-center gap-3 min-w-0 shrink-0">
             <button
               type="button"
               onClick={() => setMobileMenuOpen(true)}
@@ -499,14 +509,34 @@ export default function App() {
               <h1 className="text-sm sm:text-base font-bold text-slate-900 truncate">
                 {companySettings?.companyName || 'PT Nusantara Teknologi Mandiri'}
               </h1>
-              <p className="text-[11px] text-slate-500 truncate">
+              <p className="text-[11px] text-slate-500 truncate hidden xl:block">
                 Office Letter Management System · Direktori Penomoran & Arsip Resmi
               </p>
             </div>
           </div>
 
+          {/* Center Zone: Global Search Bar Across All Categories */}
+          <div className="order-3 lg:order-2 w-full lg:w-auto lg:flex-1 flex justify-center">
+            <GlobalSearchBar
+              onSelectLetter={(id) => setSelectedLetterId(id)}
+              onViewAllResults={(query, category) => {
+                setGlobalSearchQuery(query);
+                setGlobalSearchTrigger((c) => c + 1);
+                if (category === 'OUTGOING') {
+                  navigateTo('LETTERS_OUTGOING');
+                } else if (category === 'INCOMING') {
+                  navigateTo('LETTERS_INCOMING');
+                } else if (category === 'INTERNAL') {
+                  navigateTo('LETTERS_INTERNAL');
+                } else {
+                  navigateTo('LETTERS_ALL');
+                }
+              }}
+            />
+          </div>
+
           {/* Right Zone: Instant Role Switcher & Primary Action */}
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="order-2 lg:order-3 flex items-center gap-3 shrink-0">
             <div className="hidden sm:flex items-center gap-2 bg-slate-100 border border-slate-200 rounded-lg px-2.5 py-1">
               <span className="text-[11px] font-medium text-slate-500">Simulasi Role:</span>
               <select
@@ -571,6 +601,8 @@ export default function App() {
                   ? 'INTERNAL'
                   : 'ALL'
               }
+              externalSearchQuery={globalSearchQuery}
+              externalSearchTrigger={globalSearchTrigger}
               departments={departments}
               letterTypes={letterTypes}
               classifications={classifications}

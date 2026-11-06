@@ -1,5 +1,5 @@
 // In-memory token store (never stored in localStorage per security guidelines)
-let memoryAuthToken: string | null = 'demo_session:demo-super-admin';
+let memoryAuthToken: string | null = null;
 let activeDemoUidOverride: string | null = null;
 
 export function setAuthToken(token: string | null, demoUid?: string | null) {
