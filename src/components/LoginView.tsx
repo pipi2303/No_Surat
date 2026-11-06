@@ -32,10 +32,10 @@ const ROLE_LABELS: Record<string, string> = {
 };
 
 export function LoginView({ demoAccounts, companyName, onAuthenticated }: LoginViewProps) {
-  const [email, setEmail] = useState('superadmin@nusantaratek.co.id');
-  const [password, setPassword] = useState('Demo123!');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [selectedUid, setSelectedUid] = useState<string>('demo-super-admin');
+  const [selectedUid, setSelectedUid] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadingUid, setLoadingUid] = useState<string | null>(null);
@@ -171,9 +171,9 @@ export function LoginView({ demoAccounts, companyName, onAuthenticated }: LoginV
                   <label className="block text-xs font-semibold text-slate-700">
                     Kata Sandi
                   </label>
-                  <span className="text-[11px] font-mono text-slate-400">
-                    Default: Demo123!
-                  </span>
+                  {demoAccounts.length > 0 && (
+                    <span className="text-[11px] font-mono text-slate-400">Default: Demo123!</span>
+                  )}
                 </div>
                 <div className="relative">
                   <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />

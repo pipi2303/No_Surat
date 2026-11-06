@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { and, desc, eq, gte, ilike, lte, or, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
   auditLogs,
@@ -23,13 +23,21 @@ export const ROMAN_MONTHS = [
 ];
 
 export function hashPassword(password: string): string {
-  const salt = 'olms_enterprise_salt_v1';
-  return crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+  return `${salt}:${hash}`;
 }
 
-export function verifyPassword(password: string, hash: string): boolean {
-  if (!hash) return false;
-  return hashPassword(password) === hash;
+export function verifyPassword(password: string, stored: string): boolean {
+  if (!stored) return false;
+  if (stored.includes(':')) {
+    const [salt, hash] = stored.split(':');
+    const expected = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+    return expected === hash;
+  }
+  // ponytail: legacy static-salt fallback; migrated automatically on next login
+  const legacy = crypto.pbkdf2Sync(password, 'olms_enterprise_salt_v1', 1000, 64, 'sha512').toString('hex');
+  return legacy === stored;
 }
 
 export function getRomanMonth(monthNumber1To12: number): string {
@@ -449,7 +457,11 @@ export async function ensureSeeded() {
 
     const ruleMap = Object.fromEntries(insertedRules.map((r) => [r.category, r.id]));
 
-    // 8. Seed Demo Users for each Role
+    // 8. Seed Demo Users (non-production only)
+    if (process.env.NODE_ENV === 'production') {
+      isSeeded = true;
+      return;
+    }
     const defaultPwdHash = hashPassword('Demo123!');
     const demoUsers = await db
       .insert(users)
@@ -758,7 +770,7 @@ export async function getOrCreateUser(uid: string, email: string, displayName?: 
         name: displayName || email.split('@')[0] || 'Pengguna Korporat',
         email,
         passwordHash: '',
-        roleCode: 'SUPER_ADMIN', // Default authenticated workspace owner to SUPER_ADMIN
+        roleCode: 'STAFF', // New Firebase users start as STAFF; SUPER_ADMIN promotes manually
         departmentId: defaultDeptId,
         isActive: true,
         isDemo: false,
@@ -803,10 +815,12 @@ export async function authenticateWithCredentials(email: string, passwordPlain: 
     if (!verifyPassword(passwordPlain, user.passwordHash)) {
       return null;
     }
-    await db
-      .update(users)
-      .set({ lastLoginAt: new Date(), updatedAt: new Date() })
-      .where(eq(users.id, user.id));
+    // Migrate legacy static-salt hash to per-user random salt on successful login
+    const updateFields: Record<string, unknown> = { lastLoginAt: new Date(), updatedAt: new Date() };
+    if (user.passwordHash && !user.passwordHash.includes(':')) {
+      updateFields.passwordHash = hashPassword(passwordPlain);
+    }
+    await db.update(users).set(updateFields).where(eq(users.id, user.id));
     return user;
   } catch (error) {
     console.error('Database query failed in authenticateWithCredentials:', error);
@@ -1380,86 +1394,63 @@ export async function queryLetters(filters: {
 }) {
   try {
     await ensureSeeded();
-    const allDepts = await db.select().from(departments);
-    const allTypes = await db.select().from(letterTypes);
-    const allClass = await db.select().from(letterClassifications);
-    const allAttachments = await db.select().from(letterAttachments);
+
+    const page = Math.max(1, filters.page || 1);
+    const limit = Math.max(1, Math.min(200, filters.limit || 10));
+    const offset = (page - 1) * limit;
+
+    const conditions = [];
+    if (filters.category && filters.category !== 'ALL') conditions.push(eq(letters.category, filters.category));
+    if (filters.departmentId) conditions.push(eq(letters.departmentId, filters.departmentId));
+    if (filters.letterTypeId) conditions.push(eq(letters.letterTypeId, filters.letterTypeId));
+    if (filters.classificationId) conditions.push(eq(letters.classificationId, filters.classificationId));
+    if (filters.status && filters.status !== 'ALL') conditions.push(eq(letters.status, filters.status));
+    if (filters.dateFrom) conditions.push(gte(letters.letterDate, filters.dateFrom));
+    if (filters.dateTo) conditions.push(lte(letters.letterDate, filters.dateTo));
+    if (filters.year && filters.year !== 'ALL') conditions.push(ilike(letters.letterDate, `${filters.year}-%`));
+    if (filters.search?.trim()) {
+      const q = `%${filters.search.trim()}%`;
+      conditions.push(or(
+        ilike(letters.officialNumber, q), ilike(letters.externalOriginalNumber, q),
+        ilike(letters.letterCode, q), ilike(letters.subject, q),
+        ilike(letters.sender, q), ilike(letters.recipient, q), ilike(letters.destination, q),
+      ));
+    }
+
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // SQL-level pagination + count — no full-table load into memory
+    const [rawRows, totalResult] = await Promise.all([
+      db.select().from(letters).where(where).orderBy(desc(letters.letterDate), desc(letters.id)).limit(limit).offset(offset),
+      db.select({ total: count() }).from(letters).where(where),
+    ]);
+
+    const total = Number(totalResult[0].total);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+
+    if (rawRows.length === 0) return { items: [], total, page, limit, totalPages };
+
+    // Load reference data + attachments only for the current page
+    const [allDepts, allTypes, allClass, pageAttachments] = await Promise.all([
+      db.select().from(departments),
+      db.select().from(letterTypes),
+      db.select().from(letterClassifications),
+      db.select().from(letterAttachments).where(inArray(letterAttachments.letterId, rawRows.map((r) => r.id))),
+    ]);
 
     const deptMap = Object.fromEntries(allDepts.map((d) => [d.id, d]));
     const typeMap = Object.fromEntries(allTypes.map((t) => [t.id, t]));
     const classMap = Object.fromEntries(allClass.map((c) => [c.id, c]));
 
-    const conditions = [];
-
-    if (filters.category && filters.category !== 'ALL') {
-      conditions.push(eq(letters.category, filters.category));
-    }
-    if (filters.departmentId) {
-      conditions.push(eq(letters.departmentId, filters.departmentId));
-    }
-    if (filters.letterTypeId) {
-      conditions.push(eq(letters.letterTypeId, filters.letterTypeId));
-    }
-    if (filters.classificationId) {
-      conditions.push(eq(letters.classificationId, filters.classificationId));
-    }
-    if (filters.status && filters.status !== 'ALL') {
-      conditions.push(eq(letters.status, filters.status));
-    }
-    if (filters.dateFrom) {
-      conditions.push(gte(letters.letterDate, filters.dateFrom));
-    }
-    if (filters.dateTo) {
-      conditions.push(lte(letters.letterDate, filters.dateTo));
-    }
-    if (filters.year && filters.year !== 'ALL') {
-      conditions.push(ilike(letters.letterDate, `${filters.year}-%`));
-    }
-    if (filters.search && filters.search.trim() !== '') {
-      const q = `%${filters.search.trim()}%`;
-      conditions.push(
-        or(
-          ilike(letters.officialNumber, q),
-          ilike(letters.externalOriginalNumber, q),
-          ilike(letters.letterCode, q),
-          ilike(letters.subject, q),
-          ilike(letters.sender, q),
-          ilike(letters.recipient, q),
-          ilike(letters.destination, q)
-        )
-      );
-    }
-
-    const rawRows =
-      conditions.length > 0
-        ? await db
-            .select()
-            .from(letters)
-            .where(and(...conditions))
-            .orderBy(desc(letters.letterDate), desc(letters.id))
-        : await db.select().from(letters).orderBy(desc(letters.letterDate), desc(letters.id));
-
-    const enriched = rawRows.map((row) => ({
+    const items = rawRows.map((row) => ({
       ...row,
       department: deptMap[row.departmentId] || null,
       letterType: typeMap[row.letterTypeId] || null,
       classification: classMap[row.classificationId] || null,
-      attachments: allAttachments.filter((a) => a.letterId === row.id),
+      attachments: pageAttachments.filter((a) => a.letterId === row.id),
     }));
 
-    const page = Math.max(1, filters.page || 1);
-    const limit = Math.max(1, Math.min(200, filters.limit || 10));
-    const total = enriched.length;
-    const totalPages = Math.max(1, Math.ceil(total / limit));
-    const items = enriched.slice((page - 1) * limit, page * limit);
-
-    return {
-      items,
-      total,
-      page,
-      limit,
-      totalPages,
-    };
+    return { items, total, page, limit, totalPages };
   } catch (error) {
     console.error('Database query failed in queryLetters:', error);
     throw new Error('Gagal memuat daftar surat dari database.', { cause: error });
@@ -1511,30 +1502,30 @@ export async function getDashboardAnalytics(filters: {
 }) {
   try {
     await ensureSeeded();
-    const allLetters = await db.select().from(letters).orderBy(desc(letters.letterDate), desc(letters.id));
-    const allDepts = await db.select().from(departments);
-    const allTypes = await db.select().from(letterTypes);
-    const recentAudits = await db
-      .select()
-      .from(auditLogs)
-      .orderBy(desc(auditLogs.createdAt))
-      .limit(10);
+
+    const targetYear = filters.year || String(new Date().getFullYear());
+    const targetMonth = filters.month && filters.month !== 'ALL' ? filters.month.padStart(2, '0') : null;
+
+    // Push year + dept filter to SQL — avoids loading all-time data into memory
+    const sqlConds = [];
+    if (targetYear !== 'ALL') sqlConds.push(ilike(letters.letterDate, `${targetYear}-%`));
+    if (filters.departmentId) sqlConds.push(eq(letters.departmentId, filters.departmentId));
+    const whereLetters = sqlConds.length > 0 ? and(...sqlConds) : undefined;
+
+    const [filteredLetters, allDepts, allTypes, recentAudits] = await Promise.all([
+      db.select().from(letters).where(whereLetters).orderBy(desc(letters.letterDate), desc(letters.id)),
+      db.select().from(departments),
+      db.select().from(letterTypes),
+      db.select().from(auditLogs).orderBy(desc(auditLogs.createdAt)).limit(10),
+    ]);
 
     const deptMap = Object.fromEntries(allDepts.map((d) => [d.id, d]));
     const typeMap = Object.fromEntries(allTypes.map((t) => [t.id, t]));
 
-    const targetYear = filters.year || '2026';
-    const targetMonth = filters.month && filters.month !== 'ALL' ? filters.month.padStart(2, '0') : null;
-
-    const filteredLetters = allLetters.filter((l) => {
-      if (filters.departmentId && l.departmentId !== filters.departmentId) return false;
-      if (targetYear !== 'ALL' && !l.letterDate.startsWith(targetYear)) return false;
-      return true;
-    });
-
+    const _now = new Date();
     const currentMonthPrefix = targetMonth
       ? `${targetYear}-${targetMonth}`
-      : '2026-10'; // Default current active month in 2026
+      : `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}`;
 
     const totalRegistered = filteredLetters.filter((l) => l.status === 'REGISTERED').length;
     const totalDraft = filteredLetters.filter((l) => l.status === 'DRAFT').length;
@@ -1618,5 +1609,19 @@ export async function getDashboardAnalytics(filters: {
   } catch (error) {
     console.error('Database query failed in getDashboardAnalytics:', error);
     throw new Error('Gagal memuat data analitik dashboard.', { cause: error });
+  }
+}
+
+export async function ensureIndexes(): Promise<void> {
+  const indexes = [
+    sql`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)`,
+    sql`CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id)`,
+    sql`CREATE INDEX IF NOT EXISTS idx_letters_dept_status ON letters(department_id, status)`,
+    sql`CREATE INDEX IF NOT EXISTS idx_letters_letter_date ON letters(letter_date DESC)`,
+    sql`CREATE INDEX IF NOT EXISTS idx_letters_official_number ON letters(official_number) WHERE official_number IS NOT NULL`,
+    sql`CREATE INDEX IF NOT EXISTS idx_letters_created_by ON letters(created_by_uid)`,
+  ];
+  for (const stmt of indexes) {
+    await db.execute(stmt);
   }
 }

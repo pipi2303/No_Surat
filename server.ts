@@ -1,10 +1,10 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import { z } from 'zod';
-import { desc, eq, ilike, and, or, sql } from 'drizzle-orm';
+import { desc, eq, ilike, and, or, sql, count } from 'drizzle-orm';
 import { db } from './src/db/index.ts';
 import {
   auditLogs,
@@ -24,6 +24,7 @@ import {
   authenticateWithCredentials,
   cancelLetter,
   createOrRegisterLetter,
+  ensureIndexes,
   ensureSeeded,
   formatLetterNumber,
   getDashboardAnalytics,
@@ -37,25 +38,99 @@ import {
   updateLetterDetails,
 } from './src/db/repository.ts';
 import { AuthRequest, requireAuth, requireRoles } from './src/middleware/auth.ts';
+import {
+  IS_GCS,
+  generateStoredName,
+  getReadStream,
+  initStorage,
+  removeFile,
+  saveFile,
+} from './src/lib/storage.ts';
+
+// Structured logger
+const log = {
+  info: (msg: string, meta?: object) =>
+    console.log(JSON.stringify({ level: 'info', msg, ...meta, t: new Date().toISOString() })),
+  warn: (msg: string, meta?: object) =>
+    console.warn(JSON.stringify({ level: 'warn', msg, ...meta, t: new Date().toISOString() })),
+  error: (msg: string, err?: unknown, meta?: object) =>
+    console.error(JSON.stringify({
+      level: 'error', msg,
+      error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+      ...meta,
+      t: new Date().toISOString(),
+    })),
+};
 
 const app = express();
+// Trust the first proxy hop (Cloud Run / load balancer) so req.ip = real client IP
+app.set('trust proxy', 1);
+
+// Security headers (no helmet needed — pure Express)
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  // CSP — permissive enough for Firebase Auth SDK; tighten after testing
+  res.setHeader(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com https://apis.google.com",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https:",
+      "connect-src 'self' https://*.googleapis.com https://*.firebase.com wss://*.firebaseio.com",
+      "frame-src 'self' https://accounts.google.com https://*.firebaseapp.com",
+      "frame-ancestors 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+    ].join('; ')
+  );
+  next();
+});
+
+// CORS
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.headers.origin as string | undefined;
+  const allowed = process.env.ALLOWED_ORIGINS?.split(',').map((o) => o.trim()) ?? [];
+  if (!origin || allowed.includes(origin) || process.env.NODE_ENV !== 'production') {
+    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-demo-uid');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: '2mb' }));
+
+// Global rate limit — ponytail: in-process only; use Redis if multi-instance Cloud Run
+const _apiHits = new Map<string, { n: number; reset: number }>();
+app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+  if (req.path === '/health') return next();
+  const ip = req.ip ?? 'unknown';
+  const now = Date.now();
+  const entry = _apiHits.get(ip);
+  if (!entry || now > entry.reset) {
+    _apiHits.set(ip, { n: 1, reset: now + 60_000 });
+    return next();
+  }
+  entry.n += 1;
+  if (entry.n > 300) {
+    return res.status(429).json({ error: 'Terlalu banyak permintaan. Coba lagi dalam 1 menit.' });
+  }
+  next();
+});
 
 // Ensure uploads directory exists on disk (object storage / local filesystem, NOT Base64 in DB)
 const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const safeOriginal = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e6)}-${safeOriginal}`);
-  },
-});
 
 const ALLOWED_MIMES = [
   'application/pdf',
@@ -65,18 +140,28 @@ const ALLOWED_MIMES = [
   'image/png',
 ];
 
+const multerFileFilter = (_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  const ext = path.extname(file.originalname).toLowerCase();
+  const validExt = ['.pdf', '.docx', '.doc', '.jpg', '.jpeg', '.png'].includes(ext);
+  if (ALLOWED_MIMES.includes(file.mimetype) || validExt) {
+    cb(null, true);
+  } else {
+    cb(new Error('Format file tidak didukung. Gunakan PDF, DOCX, JPG, atau PNG.'));
+  }
+};
+
+// When GCS is configured: use memory storage (buffer); otherwise write to local disk
 const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB max
-  fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const validExt = ['.pdf', '.docx', '.doc', '.jpg', '.jpeg', '.png'].includes(ext);
-    if (ALLOWED_MIMES.includes(file.mimetype) || validExt) {
-      cb(null, true);
-    } else {
-      cb(new Error('Format file tidak didukung. Gunakan PDF, DOCX, JPG, atau PNG.'));
-    }
-  },
+  storage: IS_GCS
+    ? multer.memoryStorage()
+    : multer.diskStorage({
+        destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+        filename: (_req, file, cb) => {
+          cb(null, generateStoredName(file.originalname));
+        },
+      }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: multerFileFilter,
 });
 
 // Simple rate limiter for authentication endpoints
@@ -96,11 +181,21 @@ function checkRateLimit(ip: string): boolean {
 // 1. PUBLIC / AUTHENTICATION ROUTES
 // ============================================================================
 
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/api/health', async (_req, res) => {
+  try {
+    await db.execute(sql`SELECT 1`);
+    res.json({ status: 'ok', db: 'connected', storage: IS_GCS ? 'gcs' : 'local', timestamp: new Date().toISOString() });
+  } catch (err) {
+    log.error('Health check DB ping failed', err);
+    res.status(503).json({ status: 'error', db: 'unreachable', timestamp: new Date().toISOString() });
+  }
 });
 
 app.get('/api/auth/demo-accounts', async (_req, res) => {
+  // Disabled in production — no demo accounts exist and real user list must not be exposed
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found.' });
+  }
   try {
     await ensureSeeded();
     const allUsers = await db.select().from(users);
@@ -108,7 +203,7 @@ app.get('/api/auth/demo-accounts', async (_req, res) => {
     const deptMap = Object.fromEntries(allDepts.map((d) => [d.id, d]));
 
     const sanitized = allUsers
-      .filter((u) => u.isActive)
+      .filter((u) => u.isActive && u.isDemo)  // demo users only
       .map((u) => ({
         id: u.id,
         uid: u.uid,
@@ -122,7 +217,7 @@ app.get('/api/auth/demo-accounts', async (_req, res) => {
       }));
     res.json({ accounts: sanitized });
   } catch (error: any) {
-    console.error('Failed to fetch demo accounts:', error);
+    log.error('Failed to fetch demo accounts', error);
     res.status(500).json({ error: error.message || 'Gagal memuat daftar akun demo.' });
   }
 });
@@ -174,20 +269,24 @@ app.post('/api/auth/login', async (req, res) => {
       },
     });
   } catch (error: any) {
-    console.error('Login error:', error);
+    log.error('Login error', error);
     res.status(500).json({ error: error.message || 'Gagal memproses login.' });
   }
 });
 
-app.post('/api/auth/switch-demo', async (req, res) => {
+app.post('/api/auth/switch-demo', requireAuth, async (req: AuthRequest, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found.' });
+  }
   try {
     const { uid } = req.body;
     if (!uid) {
       return res.status(400).json({ error: 'UID akun wajib disertakan.' });
     }
     const user = await getUserByUid(String(uid));
-    if (!user || !user.isActive) {
-      return res.status(404).json({ error: 'Akun role tidak ditemukan atau nonaktif.' });
+    // Only allow switching to demo accounts
+    if (!user || !user.isActive || !user.isDemo) {
+      return res.status(404).json({ error: 'Akun demo tidak ditemukan atau nonaktif.' });
     }
 
     await recordAuditLog({
@@ -213,7 +312,7 @@ app.post('/api/auth/switch-demo', async (req, res) => {
       },
     });
   } catch (error: any) {
-    console.error('Switch demo error:', error);
+    log.error('Switch demo error', error);
     res.status(500).json({ error: error.message || 'Gagal beralih akun demo.' });
   }
 });
@@ -271,7 +370,7 @@ app.post('/api/auth/logout', requireAuth, async (req: AuthRequest, res) => {
 
 app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res) => {
   try {
-    const year = (req.query.year as string) || '2026';
+    const year = (req.query.year as string) || String(new Date().getFullYear());
     const month = (req.query.month as string) || 'ALL';
     const departmentId = req.query.departmentId ? Number(req.query.departmentId) : undefined;
     const data = await getDashboardAnalytics({ year, month, departmentId });
@@ -1003,7 +1102,15 @@ app.post(
 
       const existingRows = await db.select().from(letters).where(eq(letters.id, letterId));
       if (!existingRows[0]) {
+        // Clean up the uploaded temp file on 404
+        if (!IS_GCS && req.file?.path) fs.unlink(req.file.path, () => {});
         return res.status(404).json({ error: 'Surat tidak ditemukan.' });
+      }
+
+      // Persist to GCS if configured; disk storage already written by multer
+      const storedName = req.file.filename ?? generateStoredName(req.file.originalname);
+      if (IS_GCS && req.file.buffer) {
+        await saveFile(req.file.buffer, storedName, req.file.mimetype || 'application/octet-stream');
       }
 
       const [attachment] = await db
@@ -1011,7 +1118,7 @@ app.post(
         .values({
           letterId,
           fileName: req.file.originalname,
-          storedName: req.file.filename,
+          storedName,
           mimeType: req.file.mimetype || 'application/octet-stream',
           fileSize: req.file.size,
           uploadedByName: req.authUser!.name,
@@ -1045,9 +1152,22 @@ app.get('/api/attachments/:id/download', requireAuth, async (req: AuthRequest, r
       return res.status(404).json({ error: 'Lampiran tidak ditemukan.' });
     }
 
-    const filePath = path.join(UPLOADS_DIR, path.basename(att.storedName));
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'Berkas fisik tidak ditemukan di penyimpanan server.' });
+    // Verify requesting user has access to the letter this attachment belongs to
+    const [parentLetter] = await db.select().from(letters).where(eq(letters.id, att.letterId));
+    if (!parentLetter) {
+      return res.status(404).json({ error: 'Surat induk lampiran tidak ditemukan.' });
+    }
+    const user = req.authUser!;
+    if (user.roleCode === 'STAFF' && parentLetter.departmentId !== user.departmentId) {
+      return res.status(403).json({ error: 'Akses ditolak: lampiran ini bukan milik departemen Anda.' });
+    }
+
+    // Local-disk only: verify file existence before streaming
+    if (!IS_GCS) {
+      const filePath = path.join(UPLOADS_DIR, path.basename(att.storedName));
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Berkas fisik tidak ditemukan di penyimpanan server.' });
+      }
     }
 
     const inline = req.query.inline === 'true';
@@ -1056,7 +1176,12 @@ app.get('/api/attachments/:id/download', requireAuth, async (req: AuthRequest, r
       'Content-Disposition',
       `${inline ? 'inline' : 'attachment'}; filename="${encodeURIComponent(att.fileName)}"`
     );
-    fs.createReadStream(filePath).pipe(res);
+    const stream = getReadStream(att.storedName, UPLOADS_DIR);
+    stream.on('error', (err) => {
+      log.error('File stream error during download', err, { attachmentId: id });
+      if (!res.headersSent) res.status(500).json({ error: 'Gagal membaca berkas dari penyimpanan.' });
+    });
+    stream.pipe(res);
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Gagal mengunduh lampiran.' });
   }
@@ -1075,11 +1200,7 @@ app.delete(
         return res.status(404).json({ error: 'Lampiran tidak ditemukan.' });
       }
 
-      const filePath = path.join(UPLOADS_DIR, path.basename(att.storedName));
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-
+      await removeFile(att.storedName, UPLOADS_DIR);
       await db.delete(letterAttachments).where(eq(letterAttachments.id, id));
 
       await recordAuditLog({
@@ -1157,36 +1278,26 @@ app.get(
       const search = (req.query.search as string) || '';
       const action = (req.query.action as string) || 'ALL';
       const entityType = (req.query.entityType as string) || 'ALL';
+      const page = Math.max(1, parseInt(req.query.page as string) || 1);
+      const limit = Math.min(100, Math.max(10, parseInt(req.query.limit as string) || 50));
+      const offset = (page - 1) * limit;
 
       const conditions = [];
-      if (action !== 'ALL') {
-        conditions.push(eq(auditLogs.action, action));
-      }
-      if (entityType !== 'ALL') {
-        conditions.push(eq(auditLogs.entityType, entityType));
-      }
+      if (action !== 'ALL') conditions.push(eq(auditLogs.action, action));
+      if (entityType !== 'ALL') conditions.push(eq(auditLogs.entityType, entityType));
       if (search.trim() !== '') {
         const q = `%${search.trim()}%`;
-        conditions.push(
-          or(
-            ilike(auditLogs.description, q),
-            ilike(auditLogs.userName, q),
-            ilike(auditLogs.entityId, q)
-          )
-        );
+        conditions.push(or(ilike(auditLogs.description, q), ilike(auditLogs.userName, q), ilike(auditLogs.entityId, q)));
       }
 
-      const logs =
-        conditions.length > 0
-          ? await db
-              .select()
-              .from(auditLogs)
-              .where(and(...conditions))
-              .orderBy(desc(auditLogs.createdAt))
-              .limit(150)
-          : await db.select().from(auditLogs).orderBy(desc(auditLogs.createdAt)).limit(150);
+      const where = conditions.length > 0 ? and(...conditions) : undefined;
 
-      res.json({ items: logs });
+      const [logs, totalResult] = await Promise.all([
+        db.select().from(auditLogs).where(where).orderBy(desc(auditLogs.createdAt)).limit(limit).offset(offset),
+        db.select({ total: count() }).from(auditLogs).where(where),
+      ]);
+
+      res.json({ items: logs, total: totalResult[0].total, page, limit });
     } catch (error: any) {
       res.status(500).json({ error: error.message || 'Gagal memuat audit trail.' });
     }
@@ -1547,14 +1658,52 @@ app.post(
 );
 
 // ============================================================================
-// 8. VITE MIDDLEWARE / STATIC ASSETS SERVING
+// 8. GLOBAL ERROR HANDLER
 // ============================================================================
+
+// Must be 4-param signature for Express to recognize as error handler
+app.use((err: Error & { code?: string }, _req: Request, res: Response, _next: NextFunction) => {
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'Ukuran file melebihi batas 10 MB.' });
+  }
+  if (err.message?.startsWith('Format file tidak didukung')) {
+    return res.status(400).json({ error: err.message });
+  }
+  log.error('Unhandled server error', err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Terjadi kesalahan internal. Silakan coba lagi.' });
+  }
+});
+
+// ============================================================================
+// 9. VITE MIDDLEWARE / STATIC ASSETS SERVING
+// ============================================================================
+
+function validateEnv() {
+  const required = ['SQL_HOST', 'SQL_DB_NAME', 'SQL_USER'];
+  const missing = required.filter((k) => !process.env[k]);
+  if (missing.length > 0) {
+    log.error('Missing required environment variables', undefined, { missing });
+    process.exit(1);
+  }
+  if (process.env.NODE_ENV === 'production' && !process.env.ALLOWED_ORIGINS) {
+    log.warn('ALLOWED_ORIGINS not set in production — CORS will block cross-origin requests');
+  }
+  if (process.env.NODE_ENV === 'production' && !process.env.GCS_BUCKET) {
+    log.warn('GCS_BUCKET not set — file uploads stored on local disk (ephemeral on Cloud Run)');
+  }
+}
 
 async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
+  validateEnv();
+  await initStorage();
+  await ensureSeeded();
+  await ensureIndexes();
+
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Office Letter Management System running on http://0.0.0.0:${PORT}`);
+    log.info('Server started', { port: PORT, storage: IS_GCS ? 'gcs' : 'local', env: process.env.NODE_ENV || 'development' });
   });
 
   if (process.env.NODE_ENV !== 'production') {

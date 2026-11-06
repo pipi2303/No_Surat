@@ -31,8 +31,13 @@ export const requireAuth = async (
   const demoRoleHeader = req.headers['x-demo-uid'] as string | undefined;
 
   try {
-    // 1. Handle Demo / Credential Session Token (`demo_session:<uid>`)
+    const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+    // 1. Demo / Credential Session Token (`demo_session:<uid>`) — dev/staging only
     if (token.startsWith('demo_session:')) {
+      if (IS_PRODUCTION) {
+        return res.status(401).json({ error: 'Credential login tidak tersedia di environment produksi.' });
+      }
       const targetUid = token.replace('demo_session:', '').trim();
       const dbUser = await getUserByUid(targetUid);
       if (!dbUser || !dbUser.isActive) {
@@ -54,10 +59,10 @@ export const requireAuth = async (
     // 2. Standard Firebase ID Token verification
     const decodedToken = await adminAuth.verifyIdToken(token);
 
-    // If the user selected a demo role account in the UI switcher while signed in
-    if (demoRoleHeader) {
+    // Demo role switcher — dev/staging only, and only to demo accounts
+    if (demoRoleHeader && !IS_PRODUCTION) {
       const switchedUser = await getUserByUid(demoRoleHeader);
-      if (switchedUser && switchedUser.isActive) {
+      if (switchedUser && switchedUser.isActive && switchedUser.isDemo) {
         req.authUser = {
           id: switchedUser.id,
           uid: switchedUser.uid,
@@ -72,11 +77,10 @@ export const requireAuth = async (
       }
     }
 
-    const dbUser = await getOrCreateUser(
-      decodedToken.uid,
-      decodedToken.email || `${decodedToken.uid}@nusantaratek.co.id`,
-      decodedToken.name
-    );
+    if (!decodedToken.email) {
+      return res.status(403).json({ error: 'Akun Firebase harus memiliki alamat email yang terdaftar.' });
+    }
+    const dbUser = await getOrCreateUser(decodedToken.uid, decodedToken.email, decodedToken.name);
 
     if (!dbUser.isActive) {
       return res.status(403).json({ error: 'Akun Anda berstatus nonaktif. Hubungi Super Admin.' });
